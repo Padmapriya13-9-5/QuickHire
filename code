@@ -1,0 +1,159 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from xgboost import XGBRegressor
+from statsmodels.tsa.arima.model import ARIMA
+from prophet import Prophet
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import json
+df = pd.read_excel("data.xlsx")
+df.columns = df.columns.str.lower().str.strip()
+
+if 'sales' not in df.columns:
+    for col in df.columns:
+        if 'sale' in col or 'revenue' in col or 'amount' in col or 'total' in col:
+            df.rename(columns={col: 'sales'}, inplace=True)
+            break
+
+for col in df.columns:
+    if "date" in col:
+        df.rename(columns={col: "date"}, inplace=True)
+
+for col in df.columns:
+    if "state" in col:
+        df.rename(columns={col: "state"}, inplace=True)
+
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values(['state', 'date'])
+
+def create_features(data):
+    data['date'] = pd.to_datetime(data['date'], errors='coerce')
+    data = data.dropna(subset=['date'])
+    data = data.set_index('date')
+    data = data.asfreq('D')
+    data.index = pd.DatetimeIndex(data.index, freq='D')
+    data['sales'] = data['sales'].fillna(method='ffill')
+    data['lag1'] = data['sales'].shift(1)
+    data['lag7'] = data['sales'].shift(7)
+    data['lag30'] = data['sales'].shift(30)
+    data['rolling_mean'] = data['sales'].rolling(7).mean()
+    data['day'] = data.index.day
+    data['month'] = data.index.month
+    data['dayofweek'] = data.index.dayofweek
+    return data.dropna()
+
+def evaluate(y_true, y_pred):
+    y_true = pd.to_numeric(y_true, errors='coerce')
+    y_pred = pd.to_numeric(y_pred, errors='coerce')
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mae = np.mean(np.abs(y_true - y_pred))
+    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    y_true_safe = np.where(y_true == 0, 1, y_true)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true_safe)) * 100
+    return mae, rmse, mape
+
+results = {}
+final_forecasts = {}
+
+df['date'] = pd.to_datetime(df['date'], errors='coerce')
+df = df.dropna(subset=['date'])
+
+for state in df['state'].unique():
+    print("Processing:", state)
+
+    data = df[df['state'] == state].copy()
+    data = create_features(data)
+
+    train = data[:-56]
+    test = data[-56:]
+
+    X_train = train.drop('sales', axis=1)
+    y_train = train['sales']
+    X_test = test.drop('sales', axis=1)
+    y_test = test['sales']
+
+    X_train = X_train.apply(pd.to_numeric, errors='coerce').fillna(0)
+    X_test = X_test.apply(pd.to_numeric, errors='coerce').fillna(0)
+
+    y_train = pd.to_numeric(y_train, errors='coerce')
+    y_test = pd.to_numeric(y_test, errors='coerce')
+
+    try:
+        train_series = train['sales'].copy()
+        train_series.index = pd.DatetimeIndex(train_series.index, freq='D')
+        arima_model = ARIMA(train_series, order=(1,1,1)).fit()
+        arima_pred = arima_model.forecast(steps=56)
+        arima_mae, _, _ = evaluate(y_test, arima_pred)
+    except:
+        arima_mae = float('inf')
+
+    try:
+        p_df = train.reset_index()[['date','sales']]
+        p_df.columns = ['ds','y']
+
+        prophet_model = Prophet()
+        prophet_model.fit(p_df)
+
+        future = prophet_model.make_future_dataframe(periods=56)
+        forecast = prophet_model.predict(future)
+
+        prophet_pred = forecast['yhat'][-56:].values
+        prophet_mae, _, _ = evaluate(y_test, prophet_pred)
+    except:
+        prophet_mae = float('inf')
+
+    try:
+        xgb = XGBRegressor()
+        xgb.fit(X_train, y_train)
+        xgb_pred = xgb.predict(X_test)
+        xgb_mae, _, _ = evaluate(y_test, xgb_pred)
+    except:
+        xgb_mae = float('inf')
+
+    try:
+        X_lstm = np.array(X_train).reshape((X_train.shape[0], X_train.shape[1],1))
+        X_test_lstm = np.array(X_test).reshape((X_test.shape[0], X_test.shape[1],1))
+
+        lstm = Sequential()
+        lstm.add(LSTM(50, activation='relu', input_shape=(X_lstm.shape[1],1)))
+        lstm.add(Dense(1))
+        lstm.compile(optimizer='adam', loss='mse')
+
+        lstm.fit(X_lstm, y_train, epochs=5, verbose=0)
+
+        lstm_pred = lstm.predict(X_test_lstm).flatten()
+        lstm_mae, _, _ = evaluate(y_test, lstm_pred)
+    except:
+        lstm_mae = float('inf')
+
+    scores = {
+        "ARIMA": arima_mae,
+        "Prophet": prophet_mae,
+        "XGBoost": xgb_mae,
+        "LSTM": lstm_mae
+    }
+
+    best_model = min(scores, key=scores.get)
+    print("Best model:", best_model)
+
+    if best_model == "ARIMA":
+        future = arima_model.forecast(steps=56)
+    elif best_model == "Prophet":
+        future = prophet_model.predict(prophet_model.make_future_dataframe(periods=56))['yhat'][-56:]
+    elif best_model == "XGBoost":
+        future = xgb_pred
+    else:
+        future = lstm_pred
+
+    final_forecasts[state] = list(future)
+
+clean_data = {
+    k: [float(x) for x in v]
+    for k, v in final_forecasts.items()
+}
+
+with open("forecast.json", "w") as f:
+    json.dump(clean_data, f)
+
+print("Done! Forecast saved")
